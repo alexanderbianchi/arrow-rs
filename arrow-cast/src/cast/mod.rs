@@ -41,11 +41,13 @@ mod decimal;
 mod dictionary;
 mod list;
 mod map;
+mod run_end;
 mod string;
 use crate::cast::decimal::*;
 use crate::cast::dictionary::*;
 use crate::cast::list::*;
 use crate::cast::map::*;
+use crate::cast::run_end::*;
 use crate::cast::string::*;
 
 use arrow_buffer::IntervalMonthDayNano;
@@ -138,6 +140,9 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
         }
         (Dictionary(_, value_type), _) => can_cast_types(value_type, to_type),
         (_, Dictionary(_, value_type)) => can_cast_types(from_type, value_type),
+        // Run-end encoding support
+        (DataType::RunEndEncoded(_, values), _) => can_cast_types(values.data_type(), to_type),
+        (_, DataType::RunEndEncoded(_, _)) => true, // Allow casting any type to run-end encoded
         (List(list_from) | LargeList(list_from), List(list_to) | LargeList(list_to)) => {
             can_cast_types(list_from.data_type(), list_to.data_type())
         }
@@ -752,6 +757,14 @@ pub fn cast_with_options(
                 "Casting from dictionary type {from_type:?} to {to_type:?} not supported",
             ))),
         },
+        (RunEndEncoded(run_ends_type, _), _) => match run_ends_type.data_type() {
+            Int16 => run_end_cast::<Int16Type>(array, to_type, cast_options),
+            Int32 => run_end_cast::<Int32Type>(array, to_type, cast_options),
+            Int64 => run_end_cast::<Int64Type>(array, to_type, cast_options),
+            dt => Err(ArrowError::CastError(format!(
+                "Casting from run-end encoded array with run ends type {dt:?} not supported",
+            ))),
+        },
         (_, Dictionary(index_type, value_type)) => match **index_type {
             Int8 => cast_to_dictionary::<Int8Type>(array, value_type, cast_options),
             Int16 => cast_to_dictionary::<Int16Type>(array, value_type, cast_options),
@@ -765,6 +778,19 @@ pub fn cast_with_options(
                 "Casting from type {from_type:?} to dictionary type {to_type:?} not supported",
             ))),
         },
+        (_, DataType::RunEndEncoded(run_ends_type, values_field)) => {
+            // Cast to the target value type (this is a no-op if types already match)
+            let array_to_encode = cast_with_options(array, values_field.data_type(), cast_options)?;
+
+            match run_ends_type.data_type() {
+                Int16 => cast_to_run_array::<Int16Type>(&array_to_encode, cast_options),
+                Int32 => cast_to_run_array::<Int32Type>(&array_to_encode, cast_options),
+                Int64 => cast_to_run_array::<Int64Type>(&array_to_encode, cast_options),
+                dt => Err(ArrowError::CastError(format!(
+                    "Casting to run-end encoded array with run ends type {dt:?} not supported",
+                ))),
+            }
+        }
         (List(_), List(to)) => cast_list_values::<i32>(array, to, cast_options),
         (LargeList(_), LargeList(to)) => cast_list_values::<i64>(array, to, cast_options),
         (List(_), LargeList(list_to)) => cast_list::<i32, i64>(array, list_to, cast_options),
@@ -10683,5 +10709,58 @@ mod tests {
             2,
         )) as ArrayRef;
         assert_eq!(*fixed_array, *r);
+    }
+
+    #[test]
+    fn test_cast_run_end_encoding() {
+        // Test casting from regular array to run-end encoded
+        let array = Int32Array::from(vec![1, 1, 2, 2, 2, 3]);
+        let run_encoded = cast(
+            &array,
+            &DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::Int32, true)),
+            ),
+        )
+        .unwrap();
+
+        // Check that it's a valid run-end encoded array
+        let run_array = run_encoded
+            .as_any()
+            .downcast_ref::<RunArray<Int32Type>>()
+            .unwrap();
+        assert_eq!(run_array.len(), 6);
+
+        // Test casting from run-end encoded back to regular array
+        let decoded = cast(&run_encoded, &DataType::Int32).unwrap();
+        let decoded_values = decoded.as_primitive::<Int32Type>();
+        assert_eq!(decoded_values.values(), &[1, 1, 2, 2, 2, 3]);
+
+        // Test casting between different run-end index types
+        let run_encoded_16 = cast(
+            &run_encoded,
+            &DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int16, false)),
+                Arc::new(Field::new("values", DataType::Int32, true)),
+            ),
+        )
+        .unwrap();
+        let run_array_16 = run_encoded_16
+            .as_any()
+            .downcast_ref::<RunArray<Int16Type>>()
+            .unwrap();
+        assert_eq!(run_array_16.len(), 6);
+
+        // Test empty array
+        let empty = Int32Array::from(Vec::<i32>::new());
+        let empty_run = cast(
+            &empty,
+            &DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::Int32, true)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(empty_run.len(), 0);
     }
 }
